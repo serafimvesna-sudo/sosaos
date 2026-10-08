@@ -7,6 +7,7 @@ deno) живёт в отдельном окружении в папке данн
 """
 
 import json
+import math
 import os
 import queue
 import re
@@ -72,6 +73,18 @@ def run(args, **kwargs):
     return subprocess.run(
         [str(a) for a in args], capture_output=True, text=True, encoding='utf-8',
         errors='replace', env=child_env(), creationflags=NO_WINDOW, **kwargs)
+
+
+def notify(subtitle, text):
+    """Уведомление справа сверху (на Mac)."""
+    if not IS_MAC:
+        return
+    script = 'on run argv\ndisplay notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)\nend run'
+    try:
+        subprocess.Popen(['osascript', '-e', script, APP, subtitle, text[:200]],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
 
 
 def open_in_file_manager(path):
@@ -280,6 +293,115 @@ class Downloader:
             proc.terminate()
 
 
+# ---------------------------------------------------------------- заставка
+
+SPLASH_SECONDS = 2.8
+PINK, PURPLE = (255, 46, 136), (138, 92, 255)
+
+
+def mix(a, b, k):
+    return '#%02x%02x%02x' % tuple(int(x + (y - x) * k) for x, y in zip(a, b))
+
+
+def ease_out_back(x):
+    return 1 + 2.7 * (x - 1) ** 3 + 1.7 * (x - 1) ** 2
+
+
+class Splash:
+    """Логотип по центру экрана поверх всех окон: крутится винил, прыгает эквалайзер."""
+    W, H = 360, 420
+
+    def __init__(self, root, on_done):
+        self.on_done = on_done
+        self.win = win = tk.Toplevel(root)
+        bg = '#000001'
+        try:
+            win.overrideredirect(True)
+            win.attributes('-topmost', True)
+            if IS_MAC:
+                win.attributes('-transparent', True)
+                bg = 'systemTransparent'
+            elif IS_WIN:
+                win.attributes('-transparentcolor', bg)
+        except tk.TclError:
+            pass
+        win.configure(bg=bg)
+        self.set_alpha(0)
+        x = (win.winfo_screenwidth() - self.W) // 2
+        y = (win.winfo_screenheight() - self.H) // 2
+        win.geometry('%dx%d+%d+%d' % (self.W, self.H, x, y))
+        self.canvas = tk.Canvas(win, width=self.W, height=self.H, bg=bg, highlightthickness=0, bd=0)
+        self.canvas.pack()
+        self.canvas.bind('<Button-1>', lambda e: self.close())
+        self.start = time.monotonic()
+        self.frame()
+
+    def set_alpha(self, value):
+        try:
+            self.win.attributes('-alpha', max(0.0, min(1.0, value)))
+        except tk.TclError:
+            pass
+
+    def frame(self):
+        t = time.monotonic() - self.start
+        if t >= SPLASH_SECONDS:
+            self.close()
+            return
+        self.set_alpha(min(t / 0.2, (SPLASH_SECONDS - t) / 0.6))
+        try:
+            self.draw(t)
+            self.win.after(16, self.frame)
+        except tk.TclError:  # окно уже закрыли
+            pass
+
+    def draw(self, t):
+        c = self.canvas
+        c.delete('all')
+        cx, cy = self.W / 2, 160
+        r = 130 * ease_out_back(min(t / 0.5, 1.0))
+        if r > 2:
+            self.draw_record(cx, cy, r, t * 280)
+        title_font = ('Helvetica', 34, 'bold')
+        c.create_text(cx + 2, 337, text='DJ NELLY', fill='#000000', font=title_font)
+        c.create_text(cx, 335, text='DJ NELLY', fill='#ffffff', font=title_font)
+        bars, width, gap, base = 11, 12, 6, 408
+        left = cx - (bars * width + (bars - 1) * gap) / 2
+        for i in range(bars):
+            h = 6 + 34 * abs(math.sin(t * 6 + i * 0.7)) * (0.45 + 0.55 * abs(math.sin(t * 2.3 + i)))
+            x = left + i * (width + gap)
+            c.create_rectangle(x, base - h, x + width, base, fill=mix(PINK, PURPLE, i / (bars - 1)), outline='')
+
+    def draw_record(self, cx, cy, r, spin):
+        c = self.canvas
+
+        def circle(radius, **kw):
+            c.create_oval(cx - radius, cy - radius, cx + radius, cy + radius, **kw)
+
+        circle(r, fill='#111111', outline='#2b2b2b', width=2)
+        for start in (35, 215):  # блики на виниле
+            c.create_arc(cx - r * 0.93, cy - r * 0.93, cx + r * 0.93, cy + r * 0.93,
+                         start=start, extent=24, fill='#2c2c2c', outline='')
+        groove = 0.42
+        while groove < 0.95:
+            circle(r * groove, outline='#1d1d1d')
+            groove += 0.065
+        circle(r * 0.36, fill='#ff2e88', outline='')
+        # надписи на яблоке крутятся вместе с пластинкой
+        angle = math.radians(spin)
+        for text, dist, size in (('DJ NELLY', 0.17, 0.105), ('320 kbps', -0.19, 0.07)):
+            c.create_text(cx + r * dist * math.sin(angle), cy - r * dist * math.cos(angle),
+                          text=text, angle=-spin % 360, fill='#ffffff',
+                          font=('Helvetica', max(1, int(r * size)), 'bold'))
+        circle(r * 0.035, fill='#111111', outline='')
+
+    def close(self):
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+        self.on_done()
+
+
 # ---------------------------------------------------------------- окно
 
 class App:
@@ -326,8 +448,20 @@ class App:
         self.entry.focus_set()
         self._show_folder()
         self._poll_ui()
+        try:
+            Splash(root, on_done=self._focus)
+        except tk.TclError:
+            pass
         threading.Thread(target=self._prepare, daemon=True).start()
         threading.Thread(target=self._worker, daemon=True).start()
+
+    def _focus(self):
+        try:
+            self.root.lift()
+            self.root.focus_force()
+            self.entry.focus_set()
+        except tk.TclError:
+            pass
 
     # --- настройки
 
@@ -498,13 +632,24 @@ class App:
             target.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             self.failed.append((url, 'не могу создать папку: %s' % exc))
+            notify('Не скачалось', 'Не могу создать папку: %s' % exc)
             return []
         self.set_status(self._progress_text('Начинаю'))
         files, error = self.downloader.download(url, target, self._on_download_event)
         if error and not files:
             self.failed.append((self.title or url, error))
-        self.done_count += sum(1 for _, already in files if not already)
+        new = sum(1 for _, already in files if not already)
+        self.done_count += new
+        self._notify_result(url, files, new, error)
         return files
+
+    def _notify_result(self, url, files, new, error):
+        if not files:
+            notify('Не скачалось', '%s: %s' % (self.title or url, error))
+        elif len(files) == 1:
+            notify('Скачано' if new else 'Уже есть в папке', files[0][0].stem)
+        else:
+            notify('Скачан плейлист', 'Новых треков: %d из %d' % (new, len(files)))
 
     def _on_download_event(self, kind, text):
         if kind == 'title':
